@@ -1,5 +1,5 @@
 {
   "prefix": "!",
-  "ownerID": "YOUR_DISCORD_ID",
-  "mongoURI": "YOUR_MONGO_URI"
+  "ownerID": "albroomio",
+  "mongoURI": "mongodb+srv://AlbroomiO:<db_password>@hazelinkapp.gkwg6c2.mongodb.net/?appName=HazelinkApp"
 }
