@@ -1,271 +1,188 @@
 // ============================================================
-//  logging.js — Hazel Event Logger
-//  Tracks joins, leaves, message deletes/edits, role changes
-//  Sends formatted embeds to #hazel-logs
+//  dashboard.js — Hazelink Bot Dashboard
+//  Served at /Bot  →  https://hazelink.app/Bot
+//  Discord OAuth2 protected, MongoDB powered
 // ============================================================
 
-const { EmbedBuilder, AuditLogEvent } = require("discord.js");
+const express    = require("express");
+const path       = require("path");
+const mongoose   = require("mongoose");
 
-// ── Colour palette (matches Hazelink brand) ──────────────────
-const COLOR = {
-  join:   0x57F287, // green
-  leave:  0xED4245, // red
-  delete: 0xFEE75C, // yellow
-  edit:   0x5865F2, // blurple
-  role:   0xEB459E, // pink
-  mod:    0xFF6B35, // orange
-  info:   0x00B4D8, // cyan
-};
+const { attachAuthRoutes, requireAuth } = require("./auth");
+const { ModerationAction }              = require("./moderation");
 
-// ── Helper: find the #hazel-logs channel in a guild ──────────
-function getLogChannel(guild) {
-  return (
-    guild.channels.cache.find(
-      (c) => c.name === "hazel-logs" && c.isTextBased()
-    ) ?? null
-  );
+const app    = express();
+const PORT   = process.env.PORT ?? 3000;
+const PUBLIC = path.join(__dirname, "public");
+
+// ── Middleware ────────────────────────────────────────────────
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Static files served at /Bot/static
+app.use("/Bot/static", express.static(PUBLIC));
+
+// ── Helpers ───────────────────────────────────────────────────
+function paginationMeta(total, page, limit) {
+  return {
+    total,
+    page,
+    limit,
+    pages:   Math.ceil(total / limit),
+    hasNext: page * limit < total,
+    hasPrev: page > 1,
+  };
 }
 
-// ── Helper: safe send (no crash if channel missing) ──────────
-async function sendLog(guild, embed) {
-  const ch = getLogChannel(guild);
-  if (!ch) return;
-  try {
-    await ch.send({ embeds: [embed] });
-  } catch (_) {}
-}
+// ── Start the dashboard ───────────────────────────────────────
+function startDashboard(client) {
 
-// ── Helper: truncate long strings ────────────────────────────
-function trunc(str, max = 1024) {
-  if (!str) return "*empty*";
-  return str.length > max ? str.slice(0, max - 3) + "..." : str;
-}
+  // Attach OAuth2 login/callback/logout + cookie-parser + sessionMiddleware
+  attachAuthRoutes(app, client);
 
-// ── Helper: fetch audit log entry for an action ──────────────
-async function fetchAudit(guild, type, targetId, maxAge = 5000) {
-  try {
-    const logs = await guild.fetchAuditLogs({ type, limit: 1 });
-    const entry = logs.entries.first();
-    if (!entry) return null;
-    if (targetId && entry.target?.id !== targetId) return null;
-    if (Date.now() - entry.createdTimestamp > maxAge) return null;
-    return entry;
-  } catch (_) {
-    return null;
-  }
-}
-
-// ────────────────────────────────────────────────────────────
-//  MEMBER JOIN
-// ────────────────────────────────────────────────────────────
-async function onGuildMemberAdd(member) {
-  const age = Date.now() - member.user.createdTimestamp;
-  const ageDays = Math.floor(age / 86_400_000);
-  const newAcct = ageDays < 7;
-
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.join)
-    .setAuthor({
-      name: `${member.user.tag} joined`,
-      iconURL: member.user.displayAvatarURL({ dynamic: true }),
-    })
-    .addFields(
-      { name: "👤 User",       value: `${member} \`(${member.id})\``,           inline: false },
-      { name: "📅 Acc. Created", value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },
-      { name: "👥 Member #",   value: `${member.guild.memberCount}`,              inline: true },
-      ...(newAcct
-        ? [{ name: "⚠️ New Account", value: `Account is only **${ageDays}** day(s) old!` }]
-        : [])
-    )
-    .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
-    .setFooter({ text: "Hazel Logs • Join" })
-    .setTimestamp();
-
-  await sendLog(member.guild, embed);
-}
-
-// ────────────────────────────────────────────────────────────
-//  MEMBER LEAVE
-// ────────────────────────────────────────────────────────────
-async function onGuildMemberRemove(member) {
-  // Check if it was actually a kick via audit log
-  const auditKick = await fetchAudit(member.guild, AuditLogEvent.MemberKick, member.id);
-
-  const roles = member.roles.cache
-    .filter((r) => r.id !== member.guild.id)
-    .map((r) => `${r}`)
-    .slice(0, 10)
-    .join(", ") || "None";
-
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.leave)
-    .setAuthor({
-      name: auditKick
-        ? `${member.user.tag} was kicked`
-        : `${member.user.tag} left`,
-      iconURL: member.user.displayAvatarURL({ dynamic: true }),
-    })
-    .addFields(
-      { name: "👤 User",     value: `${member.user.tag} \`(${member.id})\``, inline: false },
-      { name: "🎭 Roles",   value: trunc(roles, 512),                         inline: false },
-      { name: "📅 Joined",  value: member.joinedAt
-          ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`
-          : "Unknown",                                                          inline: true },
-      ...(auditKick
-        ? [
-            { name: "🔨 Kicked By", value: `${auditKick.executor?.tag ?? "Unknown"}`, inline: true },
-            { name: "📝 Reason",    value: auditKick.reason ?? "No reason",            inline: false },
-          ]
-        : [])
-    )
-    .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
-    .setFooter({ text: "Hazel Logs • Leave" })
-    .setTimestamp();
-
-  await sendLog(member.guild, embed);
-}
-
-// ────────────────────────────────────────────────────────────
-//  MESSAGE DELETE
-// ────────────────────────────────────────────────────────────
-async function onMessageDelete(message) {
-  if (!message.guild || message.author?.bot) return;
-  if (!message.author) return; // partial / uncached
-
-  const audit = await fetchAudit(
-    message.guild,
-    AuditLogEvent.MessageDelete,
-    message.author.id
-  );
-  const deletedBy = audit?.executor
-    ? `${audit.executor.tag} \`(${audit.executor.id})\``
-    : "Unknown (self-delete or uncached)";
-
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.delete)
-    .setAuthor({
-      name: `Message deleted in #${message.channel.name}`,
-      iconURL: message.author.displayAvatarURL({ dynamic: true }),
-    })
-    .addFields(
-      { name: "👤 Author",     value: `${message.author.tag} \`(${message.author.id})\``, inline: true },
-      { name: "🗑️ Deleted By", value: deletedBy,                                          inline: true },
-      { name: "📝 Content",    value: trunc(message.content || "*No text content*"),       inline: false },
-      ...(message.attachments.size
-        ? [{ name: "📎 Attachments", value: message.attachments.map((a) => a.url).join("\n") }]
-        : [])
-    )
-    .setFooter({ text: `Channel ID: ${message.channel.id} • Hazel Logs` })
-    .setTimestamp();
-
-  await sendLog(message.guild, embed);
-}
-
-// ────────────────────────────────────────────────────────────
-//  MESSAGE EDIT
-// ────────────────────────────────────────────────────────────
-async function onMessageUpdate(oldMsg, newMsg) {
-  if (!newMsg.guild || newMsg.author?.bot) return;
-  if (!oldMsg.content || !newMsg.content) return;
-  if (oldMsg.content === newMsg.content) return; // embed unfurl, ignore
-
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.edit)
-    .setAuthor({
-      name: `Message edited in #${newMsg.channel.name}`,
-      iconURL: newMsg.author.displayAvatarURL({ dynamic: true }),
-    })
-    .setURL(newMsg.url)
-    .addFields(
-      { name: "👤 Author",   value: `${newMsg.author.tag} \`(${newMsg.author.id})\``, inline: true },
-      { name: "🔗 Jump",     value: `[Click to view](${newMsg.url})`,                  inline: true },
-      { name: "📝 Before",   value: trunc(oldMsg.content),                             inline: false },
-      { name: "✏️ After",    value: trunc(newMsg.content),                             inline: false }
-    )
-    .setFooter({ text: `Msg ID: ${newMsg.id} • Hazel Logs` })
-    .setTimestamp();
-
-  await sendLog(newMsg.guild, embed);
-}
-
-// ────────────────────────────────────────────────────────────
-//  ROLE CHANGES (member role add/remove)
-// ────────────────────────────────────────────────────────────
-async function onGuildMemberUpdate(oldMember, newMember) {
-  const addedRoles   = newMember.roles.cache.filter((r) => !oldMember.roles.cache.has(r.id));
-  const removedRoles = oldMember.roles.cache.filter((r) => !newMember.roles.cache.has(r.id));
-
-  if (!addedRoles.size && !removedRoles.size) return;
-
-  const audit = await fetchAudit(
-    newMember.guild,
-    AuditLogEvent.MemberRoleUpdate,
-    newMember.id
+  // ── Redirects ─────────────────────────────────────────────
+  app.get("/",    (req, res) => res.redirect("/Bot"));
+  app.get("/Bot", requireAuth, (req, res) =>
+    res.sendFile(path.join(PUBLIC, "index.html"))
   );
 
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.role)
-    .setAuthor({
-      name: `Role update — ${newMember.user.tag}`,
-      iconURL: newMember.user.displayAvatarURL({ dynamic: true }),
-    })
-    .addFields(
-      { name: "👤 Member",   value: `${newMember} \`(${newMember.id})\``,                          inline: false },
-      ...(addedRoles.size
-        ? [{ name: "➕ Roles Added",   value: addedRoles.map((r) => `${r}`).join(", "),   inline: true }]
-        : []),
-      ...(removedRoles.size
-        ? [{ name: "➖ Roles Removed", value: removedRoles.map((r) => `${r}`).join(", "), inline: true }]
-        : []),
-      ...(audit?.executor
-        ? [{ name: "🛡️ Changed By", value: `${audit.executor.tag} \`(${audit.executor.id})\``, inline: false }]
-        : [])
-    )
-    .setFooter({ text: "Hazel Logs • Role Update" })
-    .setTimestamp();
-
-  await sendLog(newMember.guild, embed);
-}
-
-// ────────────────────────────────────────────────────────────
-//  NICKNAME CHANGES
-// ────────────────────────────────────────────────────────────
-async function onNicknameUpdate(oldMember, newMember) {
-  if (oldMember.nickname === newMember.nickname) return;
-
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.info)
-    .setAuthor({
-      name: `Nickname changed — ${newMember.user.tag}`,
-      iconURL: newMember.user.displayAvatarURL({ dynamic: true }),
-    })
-    .addFields(
-      { name: "👤 Member",  value: `${newMember} \`(${newMember.id})\``,                                        inline: false },
-      { name: "📛 Before",  value: oldMember.nickname ?? "*No nickname*",                                       inline: true },
-      { name: "📛 After",   value: newMember.nickname ?? "*Nickname removed*",                                  inline: true }
-    )
-    .setFooter({ text: "Hazel Logs • Nickname" })
-    .setTimestamp();
-
-  await sendLog(newMember.guild, embed);
-}
-
-// ────────────────────────────────────────────────────────────
-//  initLogging — attach all listeners to the client
-// ────────────────────────────────────────────────────────────
-function initLogging(client) {
-  client.on("guildMemberAdd",    (member)           => onGuildMemberAdd(member));
-  client.on("guildMemberRemove", (member)           => onGuildMemberRemove(member));
-  client.on("messageDelete",     (msg)              => onMessageDelete(msg));
-  client.on("messageUpdate",     (oldMsg, newMsg)   => onMessageUpdate(oldMsg, newMsg));
-
-  // Split guildMemberUpdate into role + nickname handlers
-  client.on("guildMemberUpdate", async (oldMember, newMember) => {
-    await onGuildMemberUpdate(oldMember, newMember);
-    await onNicknameUpdate(oldMember, newMember);
+  // ── API — me ──────────────────────────────────────────────
+  app.get("/Bot/api/me", requireAuth, (req, res) => {
+    const { id, tag, username, avatar } = req.user;
+    res.json({ id, tag, username, avatar });
   });
 
-  console.log("[Logging] Event logger attached — watching #hazel-logs");
+  // ── API — bot stats ────────────────────────────────────────
+  app.get("/Bot/api/stats", requireAuth, async (req, res) => {
+    try {
+      const [total, bans, kicks, mutes, warns] = await Promise.all([
+        ModerationAction.countDocuments(),
+        ModerationAction.countDocuments({ action: "ban" }),
+        ModerationAction.countDocuments({ action: "kick" }),
+        ModerationAction.countDocuments({ action: "mute" }),
+        ModerationAction.countDocuments({ action: "warn" }),
+      ]);
+
+      res.json({
+        bot: {
+          name:    "Hazel",
+          project: "hazelink-bot",
+          guilds:  client.guilds?.cache?.size ?? 0,
+          users:   client.users?.cache?.size  ?? 0,
+          ping:    client.ws?.ping            ?? 0,
+          uptime:  client.uptime              ?? 0,
+          status:  client.isReady() ? "online" : "offline",
+        },
+        moderation: { total, bans, kicks, mutes, warns },
+        db: { connected: mongoose.connection.readyState === 1 },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API — moderation logs ─────────────────────────────────
+  app.get("/Bot/api/modlogs", requireAuth, async (req, res) => {
+    try {
+      const page    = Math.max(1,   parseInt(req.query.page  ?? "1"));
+      const limit   = Math.min(100, parseInt(req.query.limit ?? "25"));
+      const skip    = (page - 1) * limit;
+      const filter  = {};
+
+      if (req.query.action)  filter.action  = req.query.action;
+      if (req.query.guildId) filter.guildId = req.query.guildId;
+      if (req.query.userId)  filter.$or = [
+        { targetId:    req.query.userId },
+        { moderatorId: req.query.userId },
+      ];
+
+      const [records, total] = await Promise.all([
+        ModerationAction.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+        ModerationAction.countDocuments(filter),
+      ]);
+
+      res.json({ records, pagination: paginationMeta(total, page, limit) });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API — single case ─────────────────────────────────────
+  app.get("/Bot/api/modlogs/:id", requireAuth, async (req, res) => {
+    try {
+      const r = await ModerationAction.findById(req.params.id);
+      if (!r) return res.status(404).json({ error: "Case not found" });
+      res.json(r);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API — delete case (owner only) ────────────────────────
+  app.delete("/Bot/api/modlogs/:id", requireAuth, async (req, res) => {
+    if (req.user.id !== process.env.OWNER_ID)
+      return res.status(403).json({ error: "Owner only." });
+    try {
+      await ModerationAction.findByIdAndDelete(req.params.id);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API — server events feed ──────────────────────────────
+  app.get("/Bot/api/events", requireAuth, async (req, res) => {
+    try {
+      const page  = Math.max(1,   parseInt(req.query.page  ?? "1"));
+      const limit = Math.min(100, parseInt(req.query.limit ?? "25"));
+      const skip  = (page - 1) * limit;
+
+      const [records, total] = await Promise.all([
+        ModerationAction.find().sort({ createdAt: -1 }).skip(skip).limit(limit),
+        ModerationAction.countDocuments(),
+      ]);
+
+      res.json({
+        events: records.map((r) => ({
+          id:          r._id,
+          caseNumber:  r.caseNumber,
+          type:        r.action,
+          guildId:     r.guildId,
+          guildName:   r.guildName,
+          targetId:    r.targetId,
+          targetTag:   r.targetTag,
+          moderatorId: r.moderatorId,
+          moderatorTag:r.moderatorTag,
+          reason:      r.reason,
+          duration:    r.duration,
+          createdAt:   r.createdAt,
+        })),
+        pagination: paginationMeta(total, page, limit),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API — guilds ──────────────────────────────────────────
+  app.get("/Bot/api/guilds", requireAuth, (req, res) => {
+    const guilds = client.guilds?.cache?.map((g) => ({
+      id:   g.id,
+      name: g.name,
+      icon: g.iconURL({ size: 64 }),
+      memberCount: g.memberCount,
+    })) ?? [];
+    res.json(guilds);
+  });
+
+  // ── 404 ───────────────────────────────────────────────────
+  app.use("/Bot", (req, res) => res.status(404).json({ error: "Not found" }));
+
+  // ── Listen ────────────────────────────────────────────────
+  app.listen(PORT, () => {
+    console.log(`[Dashboard] Running → http://localhost:${PORT}/Bot`);
+    console.log(`[Dashboard] Production → https://hazelink.app/Bot`);
+  });
 }
 
-module.exports = { initLogging, getLogChannel, sendLog };
+module.exports = { startDashboard, app };
