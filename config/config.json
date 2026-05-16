@@ -1,0 +1,5 @@
+{
+  "prefix": "!",
+  "ownerID": "YOUR_DISCORD_ID",
+  "mongoURI": "YOUR_MONGO_URI"
+}
